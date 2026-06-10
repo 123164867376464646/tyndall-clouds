@@ -42,8 +42,8 @@ struct Uniforms {
 
     haze: f32,
     godray_steps: f32,
-    _pad0: f32,
-    _pad1: f32,
+    shadow_strength: f32,
+    shadow_softness: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -191,6 +191,49 @@ fn light_march(p: vec3<f32>) -> f32 {
     return tau;
 }
 
+// ---------- 地面云影(柔和版) ----------
+
+// 羽化阈值的云密度:把硬边界(阶跃)展宽成 smoothstep 过渡,
+// 相当于对阴影做空间模糊;柔和度越大,半影越宽
+fn cloud_density_soft(p: vec3<f32>) -> f32 {
+    let h = (p.y - u.cloud_base) / (u.cloud_top - u.cloud_base);
+    if (h < 0.0 || h > 1.0) {
+        return 0.0;
+    }
+    let wind = wind_offset();
+    let q = (p + wind + vec3<f32>(0.0, -u.time * u.evolution * 22.0, 0.0)) * 0.00042;
+    var shape = fbm(q, 3);
+    shape = mix(shape, smoothstep(0.22, 0.78, shape), 0.45);
+    let profile = saturate(remap(h, 0.0, 0.08, 0.0, 1.0))
+                * saturate(remap(h, 0.25, 1.0, 1.0, 0.0));
+    shape = shape * profile;
+
+    let edge = mix(0.02, 0.30, saturate(u.shadow_softness));
+    let x = shape - (1.0 - u.coverage);
+    return smoothstep(-edge, edge, x) * 0.12 * u.density;
+}
+
+// 地面接收的云投影:柔和密度 + 强度混合
+fn ground_shadow(p: vec3<f32>) -> f32 {
+    let sd = u.sun_dir;
+    if (sd.y < 0.02) {
+        return 1.0;
+    }
+    let t0 = max((u.cloud_base - p.y) / sd.y, 0.0);
+    let t1 = (u.cloud_top - p.y) / sd.y;
+    if (t1 <= t0) {
+        return 1.0;
+    }
+    let dt = (t1 - t0) / 5.0;
+    var tau = 0.0;
+    for (var i = 0; i < 5; i++) {
+        let lp = p + sd * (t0 + (f32(i) + 0.5) * dt);
+        tau += cloud_density_soft(lp) * dt * u.sigma;
+    }
+    let vis = exp(-tau);
+    return mix(1.0, vis, saturate(u.shadow_strength));
+}
+
 // ---------- 丁达尔效应：大气内散射 ----------
 // 在 [t_start, t_end] 区间步进，每点用 sun_visibility 调制太阳光,
 // 云的遮挡在雾中投射出明暗交替的光柱。
@@ -242,11 +285,12 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
 fn ground_color(ro: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let t = -ro.y / rd.y;
     let p = ro + rd * t;
-    let n = noise3(vec3<f32>(p.x * 0.0015, 0.0, p.z * 0.0015));
-    var albedo = mix(vec3<f32>(0.21, 0.25, 0.16), vec3<f32>(0.13, 0.16, 0.11), n);
+    // 低频多八度底纹 + 缓和的对比度，避免生硬色块
+    let n = fbm(vec3<f32>(p.x * 0.0008, 0.0, p.z * 0.0008), 3);
+    var albedo = mix(vec3<f32>(0.20, 0.24, 0.15), vec3<f32>(0.14, 0.17, 0.12), smoothstep(0.20, 0.70, n));
 
-    // 云影:地面直射光受云层透射率调制
-    let shadow = sun_visibility(p);
+    // 云影:柔和密度场 + 强度可调
+    let shadow = ground_shadow(p);
     let direct = sun_color() * saturate(u.sun_dir.y) * shadow * 1.4;
     let ambient = vec3<f32>(0.35, 0.42, 0.55) * 0.5;
     var col = albedo * (direct + ambient);

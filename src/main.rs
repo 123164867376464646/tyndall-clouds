@@ -37,6 +37,9 @@ struct Params {
     godray_intensity: f32,
     godray_steps: f32,
     haze: f32,
+    // 地面云影
+    shadow_strength: f32,
+    shadow_softness: f32,
     // 显示
     exposure: f32,
     render_scale: f32,
@@ -67,6 +70,8 @@ impl Default for Params {
             godray_intensity: 1.8,
             godray_steps: 24.0,
             haze: 1.1,
+            shadow_strength: 0.85,
+            shadow_softness: 0.65,
             exposure: 1.0,
             render_scale: 0.75,
         }
@@ -104,8 +109,8 @@ struct Uniforms {
     godray_intensity: f32,
     haze: f32,
     godray_steps: f32,
-    _pad0: f32,
-    _pad1: f32,
+    shadow_strength: f32,
+    shadow_softness: f32,
 }
 
 #[derive(Default)]
@@ -545,6 +550,13 @@ impl State {
                         ui.add(egui::Slider::new(&mut p.godray_steps, 8.0..=64.0).text("光柱步进数"));
                     });
 
+                egui::CollapsingHeader::new("🌍 地面云影")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add(egui::Slider::new(&mut p.shadow_strength, 0.0..=1.0).text("云影强度"));
+                        ui.add(egui::Slider::new(&mut p.shadow_softness, 0.0..=1.0).text("云影柔和度"));
+                    });
+
                 egui::CollapsingHeader::new("🖥 渲染质量")
                     .default_open(false)
                     .show(ui, |ui| {
@@ -649,8 +661,8 @@ impl State {
             godray_intensity: self.params.godray_intensity,
             haze: self.params.haze,
             godray_steps: self.params.godray_steps,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            shadow_strength: self.params.shadow_strength,
+            shadow_softness: self.params.shadow_softness,
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
