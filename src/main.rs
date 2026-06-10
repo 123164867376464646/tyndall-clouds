@@ -17,6 +17,9 @@ struct Params {
     detail_strength: f32,
     cloud_base: f32,
     cloud_top: f32,
+    base_jitter: f32,
+    base_feather: f32,
+    base_erosion: f32,
     steps: f32,
     light_steps: f32,
     sigma: f32,
@@ -53,6 +56,9 @@ impl Default for Params {
             detail_strength: 0.14,
             cloud_base: 1300.0,
             cloud_top: 3400.0,
+            base_jitter: 260.0,
+            base_feather: 0.10,
+            base_erosion: 0.35,
             steps: 96.0,
             light_steps: 6.0,
             sigma: 0.075,
@@ -111,6 +117,10 @@ struct Uniforms {
     godray_steps: f32,
     shadow_strength: f32,
     shadow_softness: f32,
+    base_jitter: f32,
+    base_feather: f32,
+    base_erosion: f32,
+    _pad0: f32,
 }
 
 #[derive(Default)]
@@ -520,6 +530,9 @@ impl State {
                         ui.add(egui::Slider::new(&mut p.sigma, 0.03..=0.15).text("消光系数"));
                         ui.add(egui::Slider::new(&mut p.cloud_base, 400.0..=2500.0).text("云底高度 m"));
                         ui.add(egui::Slider::new(&mut p.cloud_top, 1500.0..=6000.0).text("云顶高度 m"));
+                        ui.add(egui::Slider::new(&mut p.base_jitter, 0.0..=600.0).text("云底起伏 m"));
+                        ui.add(egui::Slider::new(&mut p.base_feather, 0.02..=0.30).text("云底羽化"));
+                        ui.add(egui::Slider::new(&mut p.base_erosion, 0.0..=1.0).text("云底破碎"));
                     });
 
                 egui::CollapsingHeader::new("🌀 动态流动")
@@ -663,6 +676,10 @@ impl State {
             godray_steps: self.params.godray_steps,
             shadow_strength: self.params.shadow_strength,
             shadow_softness: self.params.shadow_softness,
+            base_jitter: self.params.base_jitter,
+            base_feather: self.params.base_feather,
+            base_erosion: self.params.base_erosion,
+            _pad0: 0.0,
         };
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));

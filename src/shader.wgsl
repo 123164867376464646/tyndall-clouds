@@ -44,6 +44,11 @@ struct Uniforms {
     godray_steps: f32,
     shadow_strength: f32,
     shadow_softness: f32,
+
+    base_jitter: f32,
+    base_feather: f32,
+    base_erosion: f32,
+    _pad0: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -77,6 +82,23 @@ fn noise3(x: vec3<f32>) -> f32 {
     );
 }
 
+fn hash12(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn noise2(x: vec2<f32>) -> f32 {
+    let i = floor(x);
+    let f = fract(x);
+    let w = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(hash12(i), hash12(i + vec2<f32>(1.0, 0.0)), w.x),
+        mix(hash12(i + vec2<f32>(0.0, 1.0)), hash12(i + vec2<f32>(1.0, 1.0)), w.x),
+        w.y,
+    );
+}
+
 fn fbm(p: vec3<f32>, octaves: i32) -> f32 {
     var v = 0.0;
     var a = 0.5;
@@ -105,13 +127,25 @@ fn wind_offset() -> vec3<f32> {
     return vec3<f32>(cos(a), 0.0, sin(a)) * u.wind_speed * u.time;
 }
 
+// 局部云底:低频噪声把每处云底向上抬升,打破全场统一的平面切割。
+// 只向上抬(不下探),保证云体始终落在射线与 [cloud_base, cloud_top] 的求交范围内;
+// clamp 防止云底抬过云顶导致层厚为负
+fn local_cloud_base(p: vec3<f32>, wind: vec3<f32>) -> f32 {
+    if (u.base_jitter < 1.0) {
+        return u.cloud_base;
+    }
+    let n = noise2((p.xz + wind.xz) * 0.00021);
+    return min(u.cloud_base + n * u.base_jitter, u.cloud_top - 150.0);
+}
+
 fn cloud_density(p: vec3<f32>, cheap: bool) -> f32 {
-    let h = (p.y - u.cloud_base) / (u.cloud_top - u.cloud_base);
+    let wind = wind_offset();
+    let base = local_cloud_base(p, wind);
+    let h = (p.y - base) / (u.cloud_top - base);
     if (h < 0.0 || h > 1.0) {
         return 0.0;
     }
 
-    let wind = wind_offset();
     // 形状域：随风平移 + evolution 驱动的缓慢垂直推进(云体翻腾感)
     let q = (p + wind + vec3<f32>(0.0, -u.time * u.evolution * 22.0, 0.0)) * 0.00042;
 
@@ -123,8 +157,8 @@ fn cloud_density(p: vec3<f32>, cheap: bool) -> f32 {
     // 对比度锐化:把中间值推向两端,云块更分明、间隙更通透
     shape = mix(shape, smoothstep(0.22, 0.78, shape), 0.45);
 
-    // 高度造型：底部收紧、顶部渐薄
-    let profile = saturate(remap(h, 0.0, 0.08, 0.0, 1.0))
+    // 高度造型：底部收紧(羽化范围可调)、顶部渐薄
+    let profile = saturate(remap(h, 0.0, u.base_feather, 0.0, 1.0))
                 * saturate(remap(h, 0.25, 1.0, 1.0, 0.0));
     shape = shape * profile;
 
@@ -138,8 +172,10 @@ fn cloud_density(p: vec3<f32>, cheap: bool) -> f32 {
         let dq = (p + wind * 2.5
                   + vec3<f32>(u.time * u.evolution * 35.0, u.time * u.evolution * 14.0, 0.0)) * 0.0031;
         let detail = fbm(dq, 3);
-        // 边缘侵蚀(d 小处)，云顶更碎更飘逸
-        d = d - detail * u.detail_strength * (1.0 - saturate(d * 6.0)) * mix(1.0, 1.6, h);
+        // 边缘侵蚀(d 小处):顶部更碎更飘逸,base_erosion 在底部追加破碎(碎雨云感)
+        let erode = u.detail_strength * mix(1.0, 1.6, h)
+                  + u.base_erosion * 0.30 * pow(1.0 - h, 3.0);
+        d = d - detail * erode * (1.0 - saturate(d * 6.0));
     }
     return max(d, 0.0) * u.density;
 }
@@ -196,15 +232,16 @@ fn light_march(p: vec3<f32>) -> f32 {
 // 羽化阈值的云密度:把硬边界(阶跃)展宽成 smoothstep 过渡,
 // 相当于对阴影做空间模糊;柔和度越大,半影越宽
 fn cloud_density_soft(p: vec3<f32>) -> f32 {
-    let h = (p.y - u.cloud_base) / (u.cloud_top - u.cloud_base);
+    let wind = wind_offset();
+    let base = local_cloud_base(p, wind);
+    let h = (p.y - base) / (u.cloud_top - base);
     if (h < 0.0 || h > 1.0) {
         return 0.0;
     }
-    let wind = wind_offset();
     let q = (p + wind + vec3<f32>(0.0, -u.time * u.evolution * 22.0, 0.0)) * 0.00042;
     var shape = fbm(q, 3);
     shape = mix(shape, smoothstep(0.22, 0.78, shape), 0.45);
-    let profile = saturate(remap(h, 0.0, 0.08, 0.0, 1.0))
+    let profile = saturate(remap(h, 0.0, u.base_feather, 0.0, 1.0))
                 * saturate(remap(h, 0.25, 1.0, 1.0, 0.0));
     shape = shape * profile;
 
@@ -272,9 +309,11 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
     let rd_az = normalize(vec3<f32>(rd.x, 0.0, rd.z) + vec3<f32>(1e-5, 0.0, 0.0));
     let toward = pow(saturate(dot(rd_az, sun_az) * 0.5 + 0.5), 3.0);
 
-    let horizon = mix(vec3<f32>(0.50, 0.60, 0.75), vec3<f32>(1.0, 0.62, 0.36), warm_amount * toward);
-    let zenith = vec3<f32>(0.10, 0.28, 0.62);
-    var col = mix(horizon, zenith, pow(t, 0.45));
+    // 地平线亮而微蓝(避免灰白),天顶深邃饱和的湛蓝;
+    // 过渡指数偏小让蓝色更早占据中仰角 -> "天很蓝"的纵深感
+    let horizon = mix(vec3<f32>(0.42, 0.56, 0.78), vec3<f32>(1.0, 0.62, 0.36), warm_amount * toward);
+    let zenith = vec3<f32>(0.04, 0.16, 0.65);
+    var col = mix(horizon, zenith, pow(t, 0.42));
 
     let s = saturate(dot(rd, sd));
     col += sun_color() * pow(s, 6.0) * 0.30;
