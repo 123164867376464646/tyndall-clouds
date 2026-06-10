@@ -1,37 +1,53 @@
-// 体积云渲染：全屏三角形 + 片元着色器内做光线步进
+// 体积云渲染 v2：光线步进 + 丁达尔效应(云隙光) + 动态演化
 //
-// 思路：
-//   1. 云层位于 CLOUD_BASE ~ CLOUD_TOP 高度的平板(slab)内
-//   2. 视线与平板求交，在区间内做 80 步主步进
-//   3. 密度 = FBM 值噪声 × 高度造型曲线 - 覆盖率阈值 - 细节侵蚀
-//   4. 每个采样点向太阳方向做 5 步光照步进，按 Beer 定律算自阴影
-//   5. HG 相位函数产生"银边"，多重散射近似让云底不会死黑
-//   6. 前向能量守恒积分，透射率低于阈值提前退出
+// 管线结构：本着色器渲染到离屏 HDR 纹理(可降分辨率)，再由 blit.wgsl 放大到交换链
+//
+// 光路合成模型(沿视线从近到远)：
+//   [段A 大气] -> [云层] -> [段B 大气(仅向下视线)] -> [背景(天空/地面)]
+//   result = Sa + Ta * ( Scloud + Tcloud * ( Sb + Tb * bg ) )
+//   其中 S 为内散射、T 为透射率。
+//   段A/B 的内散射在每个采样点计算"向太阳穿过云层的透射率"，
+//   被云遮挡处暗、云隙处亮 —— 即丁达尔光柱(crepuscular rays)。
 
 struct Uniforms {
     resolution: vec2<f32>,
     time: f32,
-    _pad0: f32,
+    sun_intensity: f32,
+
     cam_pos: vec3<f32>,
-    _pad1: f32,
+    coverage: f32,
     sun_dir: vec3<f32>,
-    _pad2: f32,
+    density: f32,
     forward: vec3<f32>,
-    _pad3: f32,
+    sigma: f32,
     right: vec3<f32>,
-    _pad4: f32,
+    ambient: f32,
     up: vec3<f32>,
-    _pad5: f32,
+    exposure: f32,
+
+    cloud_base: f32,
+    cloud_top: f32,
+    steps: f32,
+    light_steps: f32,
+
+    wind_speed: f32,
+    wind_angle: f32,
+    evolution: f32,
+    detail_strength: f32,
+
+    phase_g: f32,
+    phase_back: f32,
+    phase_mix: f32,
+    godray_intensity: f32,
+
+    haze: f32,
+    godray_steps: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-const CLOUD_BASE: f32 = 1500.0;   // 云底高度(米)
-const CLOUD_TOP: f32 = 3600.0;    // 云顶高度
-const COVERAGE: f32 = 0.50;       // 云覆盖率 0~1
-const DENSITY: f32 = 2.2;         // 密度增益，越大云越厚实、边缘越清晰
-const SIGMA: f32 = 0.075;         // 消光系数缩放
-const MARCH_STEPS: i32 = 80;
 const PI: f32 = 3.14159265;
 
 // ---------- 噪声 ----------
@@ -61,12 +77,10 @@ fn noise3(x: vec3<f32>) -> f32 {
     );
 }
 
-// 分形布朗运动，octaves 由调用方决定(光照步进用低八度省性能)
 fn fbm(p: vec3<f32>, octaves: i32) -> f32 {
     var v = 0.0;
     var a = 0.5;
     var q = p;
-    // 每个八度做一次旋转+频率翻倍，打散轴向条纹
     let m = mat3x3<f32>(
         vec3<f32>(0.0, 0.8, 0.6),
         vec3<f32>(-0.8, 0.36, -0.48),
@@ -86,37 +100,48 @@ fn remap(v: f32, a: f32, b: f32, c: f32, d: f32) -> f32 {
 
 // ---------- 云密度 ----------
 
+fn wind_offset() -> vec3<f32> {
+    let a = u.wind_angle;
+    return vec3<f32>(cos(a), 0.0, sin(a)) * u.wind_speed * u.time;
+}
+
 fn cloud_density(p: vec3<f32>, cheap: bool) -> f32 {
-    let h = (p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE);
+    let h = (p.y - u.cloud_base) / (u.cloud_top - u.cloud_base);
     if (h < 0.0 || h > 1.0) {
         return 0.0;
     }
 
-    let wind = vec3<f32>(1.0, 0.0, 0.35) * u.time * 14.0;
-    let q = (p + wind) * 0.00042;
+    let wind = wind_offset();
+    // 形状域：随风平移 + evolution 驱动的缓慢垂直推进(云体翻腾感)
+    let q = (p + wind + vec3<f32>(0.0, -u.time * u.evolution * 22.0, 0.0)) * 0.00042;
 
     var octaves = 5;
     if (cheap) {
         octaves = 3;
     }
     var shape = fbm(q, octaves);
+    // 对比度锐化:把中间值推向两端,云块更分明、间隙更通透
+    shape = mix(shape, smoothstep(0.22, 0.78, shape), 0.45);
 
-    // 高度造型：底部收紧、顶部渐薄，接近积云轮廓
+    // 高度造型：底部收紧、顶部渐薄
     let profile = saturate(remap(h, 0.0, 0.08, 0.0, 1.0))
                 * saturate(remap(h, 0.25, 1.0, 1.0, 0.0));
     shape = shape * profile;
 
-    var d = shape - (1.0 - COVERAGE);
+    var d = shape - (1.0 - u.coverage);
     if (d <= 0.0) {
         return 0.0;
     }
 
     if (!cheap) {
-        // 高频细节只侵蚀云的边缘(d 小的地方)，保留核心
-        let detail = fbm((p + wind * 2.5) * 0.0031, 3);
-        d = d - detail * 0.13 * (1.0 - saturate(d * 6.0));
+        // 细节域：风速 2.5 倍视差 + 独立时间相位 -> 边缘持续翻滚
+        let dq = (p + wind * 2.5
+                  + vec3<f32>(u.time * u.evolution * 35.0, u.time * u.evolution * 14.0, 0.0)) * 0.0031;
+        let detail = fbm(dq, 3);
+        // 边缘侵蚀(d 小处)，云顶更碎更飘逸
+        d = d - detail * u.detail_strength * (1.0 - saturate(d * 6.0)) * mix(1.0, 1.6, h);
     }
-    return max(d, 0.0) * DENSITY;
+    return max(d, 0.0) * u.density;
 }
 
 // ---------- 光照 ----------
@@ -126,29 +151,91 @@ fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
     return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5));
 }
 
-// 朝太阳方向步进，返回到达该点的光学厚度 tau
+// 太阳颜色随高度角变暖(低角度 -> 橙红)
+fn sun_color() -> vec3<f32> {
+    let e = saturate(u.sun_dir.y * 2.2);
+    return mix(vec3<f32>(1.0, 0.45, 0.18), vec3<f32>(1.0, 0.96, 0.90), pow(e, 0.6));
+}
+
+// 从 p 点向太阳穿过整个云层的透射率(用于丁达尔光柱与地面云影)
+fn sun_visibility(p: vec3<f32>) -> f32 {
+    let sd = u.sun_dir;
+    if (sd.y < 0.02) {
+        return 1.0;
+    }
+    let t0 = max((u.cloud_base - p.y) / sd.y, 0.0);
+    let t1 = (u.cloud_top - p.y) / sd.y;
+    if (t1 <= t0) {
+        return 1.0;
+    }
+    let dt = (t1 - t0) / 5.0;
+    var tau = 0.0;
+    for (var i = 0; i < 5; i++) {
+        let lp = p + sd * (t0 + (f32(i) + 0.5) * dt);
+        tau += cloud_density(lp, true) * dt * u.sigma;
+    }
+    return exp(-tau);
+}
+
+// 云内部向太阳的光照步进(指数间距，自阴影)
 fn light_march(p: vec3<f32>) -> f32 {
     var tau = 0.0;
     var marched = 0.0;
-    for (var j = 0; j < 5; j++) {
-        let seg = 80.0 * exp2(f32(j));
+    let n = i32(u.light_steps);
+    for (var j = 0; j < n; j++) {
+        let seg = 60.0 * exp2(f32(j));
         let lp = p + u.sun_dir * (marched + seg * 0.5);
-        tau += cloud_density(lp, true) * seg * SIGMA;
+        tau += cloud_density(lp, true) * seg * u.sigma;
         marched += seg;
     }
     return tau;
 }
 
+// ---------- 丁达尔效应：大气内散射 ----------
+// 在 [t_start, t_end] 区间步进，每点用 sun_visibility 调制太阳光,
+// 云的遮挡在雾中投射出明暗交替的光柱。
+// 返回 x = 太阳内散射积分, y = 累计光学厚度
+fn god_rays(ro: vec3<f32>, rd: vec3<f32>, t_start: f32, t_end: f32, steps: i32, jitter: f32) -> vec2<f32> {
+    if (steps <= 0 || t_end - t_start < 1.0 || u.haze < 0.001) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let dt = (t_end - t_start) / f32(steps);
+    var t = t_start + dt * jitter;
+    var sun_acc = 0.0;
+    var od = 0.0;
+    for (var i = 0; i < steps; i++) {
+        let p = ro + rd * t;
+        // 雾密度随海拔指数衰减
+        let hfall = exp(-max(p.y, 0.0) * 0.00035);
+        let step_od = u.haze * hfall * dt * 0.0001;
+        // 平方增强云影对比 -> 光柱明暗更分明
+        let vis = sun_visibility(p);
+        sun_acc += vis * vis * exp(-od) * step_od;
+        od += step_od;
+        t += dt;
+    }
+    return vec2<f32>(sun_acc, od);
+}
+
 // ---------- 背景 ----------
 
 fn sky_color(rd: vec3<f32>) -> vec3<f32> {
+    let sd = u.sun_dir;
     let t = saturate(rd.y);
-    var col = mix(vec3<f32>(0.62, 0.72, 0.86), vec3<f32>(0.18, 0.40, 0.78), pow(t, 0.6));
 
-    let s = saturate(dot(rd, u.sun_dir));
-    // 太阳光晕 + 日盘
-    col += vec3<f32>(1.0, 0.85, 0.6) * pow(s, 7.0) * 0.22;
-    col += vec3<f32>(1.0, 0.92, 0.8) * smoothstep(0.9993, 0.9998, s) * 18.0;
+    // 低太阳时地平线朝太阳方向染暖色
+    let warm_amount = saturate(1.0 - sd.y * 3.0);
+    let sun_az = normalize(vec3<f32>(sd.x, 0.0, sd.z) + vec3<f32>(1e-5, 0.0, 0.0));
+    let rd_az = normalize(vec3<f32>(rd.x, 0.0, rd.z) + vec3<f32>(1e-5, 0.0, 0.0));
+    let toward = pow(saturate(dot(rd_az, sun_az) * 0.5 + 0.5), 3.0);
+
+    let horizon = mix(vec3<f32>(0.50, 0.60, 0.75), vec3<f32>(1.0, 0.62, 0.36), warm_amount * toward);
+    let zenith = vec3<f32>(0.10, 0.28, 0.62);
+    var col = mix(horizon, zenith, pow(t, 0.45));
+
+    let s = saturate(dot(rd, sd));
+    col += sun_color() * pow(s, 6.0) * 0.30;
+    col += sun_color() * smoothstep(0.9993, 0.9999, s) * 24.0;
     return col;
 }
 
@@ -156,48 +243,51 @@ fn ground_color(ro: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     let t = -ro.y / rd.y;
     let p = ro + rd * t;
     let n = noise3(vec3<f32>(p.x * 0.0015, 0.0, p.z * 0.0015));
-    var col = mix(vec3<f32>(0.21, 0.26, 0.15), vec3<f32>(0.14, 0.18, 0.11), n);
-    col *= 0.75 + 0.5 * saturate(u.sun_dir.y);
-    // 远处融入大气雾色
-    let fog = 1.0 - exp(-t * 0.00012);
-    return mix(col, vec3<f32>(0.66, 0.74, 0.86), fog);
+    var albedo = mix(vec3<f32>(0.21, 0.25, 0.16), vec3<f32>(0.13, 0.16, 0.11), n);
+
+    // 云影:地面直射光受云层透射率调制
+    let shadow = sun_visibility(p);
+    let direct = sun_color() * saturate(u.sun_dir.y) * shadow * 1.4;
+    let ambient = vec3<f32>(0.35, 0.42, 0.55) * 0.5;
+    var col = albedo * (direct + ambient);
+
+    // 远处轻微融入地平线色(主要雾效由 god_rays 的光学厚度承担)
+    let fog = 1.0 - exp(-t * 0.00005);
+    return mix(col, vec3<f32>(0.66, 0.72, 0.84), fog);
 }
 
 // ---------- 体积云步进 ----------
 
-// 返回 rgb = 云的累计散射光, a = 剩余透射率(用于和背景合成)
 fn march_clouds(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, bg: vec3<f32>) -> vec4<f32> {
     var rdy = rd.y;
     if (abs(rdy) < 1e-4) {
         rdy = 1e-4;
     }
-    let t_bot = (CLOUD_BASE - ro.y) / rdy;
-    let t_top = (CLOUD_TOP - ro.y) / rdy;
-    var t0 = min(t_bot, t_top);
+    let t_bot = (u.cloud_base - ro.y) / rdy;
+    let t_top = (u.cloud_top - ro.y) / rdy;
+    var t0 = max(min(t_bot, t_top), 0.0);
     var t1 = max(t_bot, t_top);
-    t0 = max(t0, 0.0);
-    // 太远的云直接当背景，近地平线的超长射线也截断掉
     if (t1 <= 0.0 || t0 > 30000.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    t1 = min(t1, t0 + 16000.0);
+    t1 = min(t1, t0 + 18000.0);
 
-    let dt = (t1 - t0) / f32(MARCH_STEPS);
+    let steps = clamp(i32(u.steps), 16, 256);
+    let dt = (t1 - t0) / f32(steps);
     var t = t0 + dt * jitter;
 
     let cos_theta = dot(rd, u.sun_dir);
-    // 前向散射(银边) + 少量后向散射
     let phase = mix(
-        henyey_greenstein(cos_theta, 0.55),
-        henyey_greenstein(cos_theta, -0.35),
-        0.3,
+        henyey_greenstein(cos_theta, u.phase_g),
+        henyey_greenstein(cos_theta, -abs(u.phase_back)),
+        u.phase_mix,
     );
-    let sun_col = vec3<f32>(1.0, 0.93, 0.82);
+    let sun_c = sun_color();
 
     var trans = 1.0;
     var col = vec3<f32>(0.0);
 
-    for (var i = 0; i < MARCH_STEPS; i++) {
+    for (var i = 0; i < steps; i++) {
         if (trans < 0.015) {
             break;
         }
@@ -205,18 +295,17 @@ fn march_clouds(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, bg: vec3<f32>) -> vec
         let den = cloud_density(p, false);
         if (den > 0.004) {
             let tau = light_march(p);
-            // Beer 定律 + 多重散射近似(防止云底死黑)
+            // Beer 定律 + 多重散射近似
             let light = max(exp(-tau), exp(-tau * 0.25) * 0.25);
-            let h = saturate((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE));
-            let ambient = mix(vec3<f32>(0.34, 0.42, 0.58), vec3<f32>(0.72, 0.80, 0.95), h);
-            var lum = sun_col * light * phase * 32.0 + ambient * 0.85;
+            let h = saturate((p.y - u.cloud_base) / (u.cloud_top - u.cloud_base));
+            let amb = mix(vec3<f32>(0.26, 0.33, 0.46), vec3<f32>(0.80, 0.87, 1.0), h);
+            var lum = sun_c * light * phase * u.sun_intensity + amb * u.ambient;
 
-            // 远处的云逐渐融入大气
-            let atmos = exp(-t * 0.00006);
+            // 远处云融入大气
+            let atmos = exp(-t * 0.00005 * max(u.haze, 0.15));
             lum = mix(bg, lum, atmos);
 
-            // 能量守恒的前向积分
-            let step_trans = exp(-den * SIGMA * dt);
+            let step_trans = exp(-den * u.sigma * dt);
             col += lum * (1.0 - step_trans) * trans;
             trans *= step_trans;
         }
@@ -225,11 +314,21 @@ fn march_clouds(ro: vec3<f32>, rd: vec3<f32>, jitter: f32, bg: vec3<f32>) -> vec
     return vec4<f32>(col, trans);
 }
 
+// ---------- 色调映射 ----------
+
+fn aces(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return saturate(x * (a * x + b) / (x * (c * x + d) + e));
+}
+
 // ---------- 入口 ----------
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    // 覆盖全屏的大三角形: (-1,-1) (-1,3) (3,-1)
     let x = f32(vi / 2u) * 4.0 - 1.0;
     let y = f32(vi % 2u) * 4.0 - 1.0;
     return vec4<f32>(x, y, 0.0, 1.0);
@@ -251,12 +350,63 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         bg = sky_color(rd);
     }
 
-    // 抖动起步位置消除步进条带
-    let jitter = hash13(vec3<f32>(pos.x, pos.y, fract(u.time) * 61.7));
-    let clouds = march_clouds(ro, rd, jitter, bg);
-    var col = bg * clouds.a + clouds.rgb;
+    let j1 = hash13(vec3<f32>(pos.x, pos.y, fract(u.time) * 61.7));
+    let j2 = hash13(vec3<f32>(pos.y, pos.x, fract(u.time) * 47.3));
 
-    // 简单的曝光色调映射(交换链是 sRGB 格式，伽马由硬件处理)
-    col = vec3<f32>(1.0) - exp(-col * 1.1);
+    let clouds = march_clouds(ro, rd, j1, bg);
+
+    // ---- 丁达尔效应的两段大气 ----
+    var rdy = rd.y;
+    if (abs(rdy) < 1e-4) {
+        rdy = 1e-4;
+    }
+    let cap = 16000.0;
+    var ground_t = cap;
+    if (rd.y < -0.0005) {
+        ground_t = max(-ro.y / rd.y, 0.0);
+    }
+    let t_bot = (u.cloud_base - ro.y) / rdy;
+    let t_top = (u.cloud_top - ro.y) / rdy;
+    let s0 = max(min(t_bot, t_top), 0.0);
+    let s1 = max(t_bot, t_top);
+
+    // 段A: 相机 -> 云层入口(或地面/上限)
+    var a1 = min(ground_t, cap);
+    if (s1 > 0.0 && s0 < a1) {
+        a1 = s0;
+    }
+    // 段B: 云层底部出口 -> 地面(仅向下视线，相机在云上/云中时)
+    var b0 = 0.0;
+    var b1 = -1.0;
+    if (rd.y < -0.0005 && t_bot > 0.0) {
+        b0 = t_bot;
+        b1 = min(ground_t, b0 + 16000.0);
+    }
+
+    let n_gr = clamp(i32(u.godray_steps), 4, 96);
+    let gr_a = god_rays(ro, rd, 0.0, a1, n_gr, j2);
+    var gr_b = vec2<f32>(0.0, 0.0);
+    if (b1 > b0 + 1.0) {
+        gr_b = god_rays(ro, rd, b0, b1, max(n_gr / 2, 4), j2);
+    }
+
+    let cos_theta = dot(rd, u.sun_dir);
+    // 紧凑前向 Mie 瓣(光晕集中在太阳附近) + 少量宽瓣(远处隐约可见)
+    let mie = henyey_greenstein(cos_theta, 0.80) * 0.88 + henyey_greenstein(cos_theta, 0.30) * 0.12;
+    let sun_c = sun_color();
+    let amb_air = vec3<f32>(0.50, 0.60, 0.75);
+    // 0.02: 把"太阳强度"(为云层光照标定)折算到大气内散射的能量尺度,
+    // 峰值控制在 ACES 肩部以下,保留光柱明暗对比(不剪裁成纯白)
+    let s_gain = u.sun_intensity * u.godray_intensity * mie * 0.02;
+
+    let scatter_a = sun_c * s_gain * gr_a.x + amb_air * gr_a.y * 0.10;
+    let scatter_b = sun_c * s_gain * gr_b.x + amb_air * gr_b.y * 0.10;
+    let trans_a = exp(-gr_a.y);
+    let trans_b = exp(-gr_b.y);
+
+    // 近到远合成: 段A -> 云 -> 段B -> 背景
+    var col = scatter_a + trans_a * (clouds.rgb + clouds.a * (scatter_b + trans_b * bg));
+
+    col = aces(col * u.exposure);
     return vec4<f32>(col, 1.0);
 }

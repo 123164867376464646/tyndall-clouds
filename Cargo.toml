@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wgpu = "26"
+wgpu = "25"
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 env_logger = "0.11"
+egui = "0.32"
+egui-wgpu = "0.32"
+egui-winit = { version = "0.32", default-features = false }
 
 [profile.dev]
 opt-level = 1
