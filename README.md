@@ -4,7 +4,7 @@
 
 v2 参考 [three-geospatial 的 London 演示](https://takram-design-engineering.github.io/three-geospatial/?path=/story/clouds-3d-tiles-renderer-integration--london)进行了大幅升级：**丁达尔效应（云隙光柱）**、**云层动态翻腾演化**、**egui 实时调参面板**。
 
-![screenshot](screenshot.png)
+![screenshot](2026-06-10-14-45-47.gif)
 
 ## 技术原理
 
